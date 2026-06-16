@@ -19,11 +19,25 @@ if (!fs.existsSync(DATA_DIR)) {
 
 // ---- Storage helpers ----
 function loadData() {
+  let data;
   try {
-    return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
   } catch (e) {
-    return {};
+    data = {};
   }
+
+  // Migrate from old format (plain number = sale count) to new format
+  for (const name in data) {
+    if (typeof data[name] === 'number') {
+      data[name] = { count: data[name], total: 0, lastSale: null };
+    } else {
+      if (typeof data[name].count !== 'number') data[name].count = 0;
+      if (typeof data[name].total !== 'number') data[name].total = 0;
+      if (!('lastSale' in data[name])) data[name].lastSale = null;
+    }
+  }
+
+  return data;
 }
 
 function saveData(data) {
@@ -46,9 +60,19 @@ async function postToGroupMe(text) {
   }
 }
 
+// ---- Formatting ----
+function formatMoney(amount) {
+  return '$' + amount.toLocaleString('en-US', {
+    maximumFractionDigits: 2,
+    minimumFractionDigits: 0,
+  });
+}
+
 // ---- Leaderboard ----
 function buildLeaderboard(data) {
-  const entries = Object.entries(data).sort((a, b) => b[1] - a[1]);
+  const entries = Object.entries(data).sort((a, b) => {
+    return b[1].total - a[1].total || b[1].count - a[1].count;
+  });
 
   if (entries.length === 0) {
     return "📊 No sales logged yet. Type '@sale' to log your first sale!";
@@ -57,10 +81,10 @@ function buildLeaderboard(data) {
   const medals = ['🥇', '🥈', '🥉'];
   const lines = ['🏆 SALES LEADERBOARD 🏆', ''];
 
-  entries.forEach(([name, count], i) => {
+  entries.forEach(([name, info], i) => {
     const rankMarker = medals[i] || `${i + 1}.`;
-    const saleLabel = count === 1 ? 'sale' : 'sales';
-    lines.push(`${rankMarker} ${name} — ${count} ${saleLabel}`);
+    const saleLabel = info.count === 1 ? 'sale' : 'sales';
+    lines.push(`${rankMarker} ${name} — ${formatMoney(info.total)} (${info.count} ${saleLabel})`);
   });
 
   return lines.join('\n');
@@ -79,18 +103,18 @@ app.post('/callback', async (req, res) => {
 
   const data = loadData();
 
-  // --- @sale  /  @sale Name  /  @sale Name 3 ---
+  // --- @sale  /  @sale 500  /  @sale Name  /  @sale Name 500 ---
   if (/^@sale\b/i.test(text)) {
     const rest = text.replace(/^@sale/i, '').trim();
     let targetName = sender;
-    let amount = 1;
+    let amount = 0;
 
     if (rest) {
       const parts = rest.split(/\s+/);
-      const lastPart = parts[parts.length - 1];
+      const lastPart = parts[parts.length - 1].replace(/[$,]/g, '');
 
-      if (/^\d+$/.test(lastPart)) {
-        amount = parseInt(lastPart, 10);
+      if (/^\d+(\.\d+)?$/.test(lastPart)) {
+        amount = parseFloat(lastPart);
         parts.pop();
       }
 
@@ -99,17 +123,18 @@ app.post('/callback', async (req, res) => {
       }
     }
 
-    if (amount <= 0) {
-      await postToGroupMe('⚠️ Sale amount must be a positive number.');
-      return;
+    if (!data[targetName]) {
+      data[targetName] = { count: 0, total: 0, lastSale: null };
     }
 
-    data[targetName] = (data[targetName] || 0) + amount;
+    data[targetName].count += 1;
+    data[targetName].total += amount;
+    data[targetName].lastSale = amount;
     saveData(data);
 
-    const saleLabel = amount === 1 ? 'sale' : 'sales';
+    const amountText = amount > 0 ? ` worth ${formatMoney(amount)}` : '';
     await postToGroupMe(
-      `✅ +${amount} ${saleLabel} for ${targetName}! Total: ${data[targetName]}\n\n${buildLeaderboard(data)}`
+      `✅ New sale for ${targetName}${amountText}! Total: ${formatMoney(data[targetName].total)} (${data[targetName].count} sales)\n\n${buildLeaderboard(data)}`
     );
     return;
   }
@@ -119,11 +144,14 @@ app.post('/callback', async (req, res) => {
     const rest = text.replace(/^@undo/i, '').trim();
     const targetName = rest ? rest.replace(/^@/, '') : sender;
 
-    if (data[targetName] && data[targetName] > 0) {
-      data[targetName] -= 1;
+    if (data[targetName] && data[targetName].count > 0) {
+      const lastAmount = data[targetName].lastSale || 0;
+      data[targetName].count -= 1;
+      data[targetName].total -= lastAmount;
+      data[targetName].lastSale = null; // only the most recent sale can be undone
       saveData(data);
       await postToGroupMe(
-        `↩️ Removed 1 sale from ${targetName}. New total: ${data[targetName]}\n\n${buildLeaderboard(data)}`
+        `↩️ Removed last sale from ${targetName}. New total: ${formatMoney(data[targetName].total)} (${data[targetName].count} sales)\n\n${buildLeaderboard(data)}`
       );
     } else {
       await postToGroupMe(`⚠️ ${targetName} has no sales to undo.`);
@@ -148,11 +176,11 @@ app.post('/callback', async (req, res) => {
   if (/^@salehelp\b/i.test(text)) {
     await postToGroupMe(
       '📋 Sales Bot Commands:\n' +
-        '@sale — log 1 sale for yourself\n' +
-        '@sale Name — log 1 sale for Name\n' +
-        '@sale Name 3 — log 3 sales for Name\n' +
+        '@sale — log a sale for yourself (no $ value)\n' +
+        '@sale 500 — log a sale worth $500 for yourself\n' +
+        '@sale Mike 500 — log a $500 sale for Mike\n' +
         '@undo — remove your last sale\n' +
-        '@undo Name — remove a sale from Name\n' +
+        "@undo Mike — remove Mike's last sale\n" +
         '@leaderboard — show current standings\n' +
         '@reset confirm — reset ALL totals to zero'
     );
