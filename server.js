@@ -17,23 +17,63 @@ if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
+// ---- Date helpers ----
+function getTodayKey(date = new Date()) {
+  // YYYY-MM-DD in local time
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+function getWeekKey(date = new Date()) {
+  // Week key based on the Monday of the current week: YYYY-MM-DD (Monday's date)
+  const d = new Date(date);
+  const day = d.getDay(); // 0 = Sunday, 1 = Monday, ...
+  const diffToMonday = day === 0 ? -6 : 1 - day;
+  d.setDate(d.getDate() + diffToMonday);
+  return getTodayKey(d);
+}
+
+function formatDateLabel(date = new Date()) {
+  return date.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
+}
+
+function formatWeekLabel(date = new Date()) {
+  const d = new Date(date);
+  const day = d.getDay();
+  const diffToMonday = day === 0 ? -6 : 1 - day;
+  const monday = new Date(d);
+  monday.setDate(d.getDate() + diffToMonday);
+  const sunday = new Date(monday);
+  sunday.setDate(monday.getDate() + 6);
+  const opts = { month: 'short', day: 'numeric' };
+  return `${monday.toLocaleDateString('en-US', opts)} - ${sunday.toLocaleDateString('en-US', opts)}`;
+}
+
 // ---- Storage helpers ----
 function loadData() {
-  let data;
+  let raw;
   try {
-    data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
   } catch (e) {
-    data = {};
+    raw = {};
   }
 
-  // Migrate from old format (plain number = sale count) to new format
-  for (const name in data) {
-    if (typeof data[name] === 'number') {
-      data[name] = { count: data[name], total: 0, lastSale: null };
+  // wrap old flat format { Name: {...} } into { agents: { Name: {...} } }
+  let data = raw.agents ? raw : { agents: raw };
+  if (!data.agents) data.agents = {};
+
+  for (const name in data.agents) {
+    const a = data.agents[name];
+    if (typeof a === 'number') {
+      data.agents[name] = { count: a, total: 0, lastSale: null, daily: {}, weekly: {} };
     } else {
-      if (typeof data[name].count !== 'number') data[name].count = 0;
-      if (typeof data[name].total !== 'number') data[name].total = 0;
-      if (!('lastSale' in data[name])) data[name].lastSale = null;
+      if (typeof a.count !== 'number') a.count = 0;
+      if (typeof a.total !== 'number') a.total = 0;
+      if (!('lastSale' in a)) a.lastSale = null;
+      if (!a.daily) a.daily = {};
+      if (!a.weekly) a.weekly = {};
     }
   }
 
@@ -68,40 +108,65 @@ function formatMoney(amount) {
   });
 }
 
-// ---- Leaderboard ----
-function buildLeaderboard(data) {
-  const entries = Object.entries(data).sort((a, b) => {
-    return b[1].total - a[1].total || b[1].count - a[1].count;
-  });
+// ---- Leaderboards ----
+function buildLeaderboard(agents, periodKey, periodType, label) {
+  const entries = Object.entries(agents)
+    .map(([name, info]) => {
+      const bucket = periodType === 'daily' ? info.daily : periodType === 'weekly' ? info.weekly : null;
+      const total = bucket ? (bucket[periodKey]?.total || 0) : info.total;
+      const count = bucket ? (bucket[periodKey]?.count || 0) : info.count;
+      return [name, total, count];
+    })
+    .filter(([, total, count]) => count > 0)
+    .sort((a, b) => b[1] - a[1] || b[2] - a[2]);
+
+  const titleMap = {
+    daily: `📅 TODAY'S SALES — ${label}`,
+    weekly: `📈 THIS WEEK'S SALES — ${label}`,
+    allTime: '🏆 ALL-TIME LEADERBOARD 🏆',
+  };
+  const title = titleMap[periodType];
 
   if (entries.length === 0) {
-    return "📊 No sales logged yet. Type '@sale' to log your first sale!";
+    return `${title}\n\nNo sales logged yet for this period.`;
   }
 
   const medals = ['🥇', '🥈', '🥉'];
-  const lines = ['🏆 SALES LEADERBOARD 🏆', ''];
+  const lines = [title, ''];
 
-  entries.forEach(([name, info], i) => {
+  entries.forEach(([name, total, count], i) => {
     const rankMarker = medals[i] || `${i + 1}.`;
-    const saleLabel = info.count === 1 ? 'sale' : 'sales';
-    lines.push(`${rankMarker} ${name} — ${formatMoney(info.total)} (${info.count} ${saleLabel})`);
+    const saleLabel = count === 1 ? 'sale' : 'sales';
+    lines.push(`${rankMarker} ${name} — ${formatMoney(total)} (${count} ${saleLabel})`);
   });
 
   return lines.join('\n');
 }
 
+function buildAllTimeLeaderboard(agents) {
+  return buildLeaderboard(agents, null, 'allTime', null);
+}
+
+function buildDailyLeaderboard(agents, date = new Date()) {
+  return buildLeaderboard(agents, getTodayKey(date), 'daily', formatDateLabel(date));
+}
+
+function buildWeeklyLeaderboard(agents, date = new Date()) {
+  return buildLeaderboard(agents, getWeekKey(date), 'weekly', formatWeekLabel(date));
+}
+
 // ---- Webhook ----
 app.post('/callback', async (req, res) => {
-  // Respond right away - GroupMe just needs a 200
-  res.sendStatus(200);
+  res.sendStatus(200); // GroupMe just needs a fast 200
 
   const msg = req.body;
-  if (!msg || msg.sender_type === 'bot') return; // don't react to ourselves
+  if (!msg || msg.sender_type === 'bot') return;
 
   const text = (msg.text || '').trim();
   const sender = msg.name || 'Unknown';
 
   const data = loadData();
+  const agents = data.agents;
 
   // --- @sale  /  @sale 500  /  @sale Name  /  @sale Name 500 ---
   if (/^@sale\b/i.test(text)) {
@@ -123,19 +188,40 @@ app.post('/callback', async (req, res) => {
       }
     }
 
-    if (!data[targetName]) {
-      data[targetName] = { count: 0, total: 0, lastSale: null };
+    if (!agents[targetName]) {
+      agents[targetName] = { count: 0, total: 0, lastSale: null, daily: {}, weekly: {} };
     }
+    const agent = agents[targetName];
 
-    data[targetName].count += 1;
-    data[targetName].total += amount;
-    data[targetName].lastSale = amount;
+    const now = new Date();
+    const dayKey = getTodayKey(now);
+    const weekKey = getWeekKey(now);
+
+    if (!agent.daily[dayKey]) agent.daily[dayKey] = { count: 0, total: 0 };
+    if (!agent.weekly[weekKey]) agent.weekly[weekKey] = { count: 0, total: 0 };
+
+    agent.count += 1;
+    agent.total += amount;
+    agent.lastSale = { amount, dayKey, weekKey };
+
+    agent.daily[dayKey].count += 1;
+    agent.daily[dayKey].total += amount;
+    agent.weekly[weekKey].count += 1;
+    agent.weekly[weekKey].total += amount;
+
     saveData(data);
 
     const amountText = amount > 0 ? ` worth ${formatMoney(amount)}` : '';
-    await postToGroupMe(
-      `✅ New sale for ${targetName}${amountText}! Total: ${formatMoney(data[targetName].total)} (${data[targetName].count} sales)\n\n${buildLeaderboard(data)}`
-    );
+    const todayInfo = agent.daily[dayKey];
+
+    const message = [
+      `✅ New sale for ${targetName}${amountText}!`,
+      `Today: ${formatMoney(todayInfo.total)} (${todayInfo.count} sales) | All-time: ${formatMoney(agent.total)} (${agent.count} sales)`,
+      '',
+      buildDailyLeaderboard(agents, now),
+    ].join('\n');
+
+    await postToGroupMe(message);
     return;
   }
 
@@ -143,31 +229,54 @@ app.post('/callback', async (req, res) => {
   if (/^@undo\b/i.test(text)) {
     const rest = text.replace(/^@undo/i, '').trim();
     const targetName = rest ? rest.replace(/^@/, '') : sender;
+    const agent = agents[targetName];
 
-    if (data[targetName] && data[targetName].count > 0) {
-      const lastAmount = data[targetName].lastSale || 0;
-      data[targetName].count -= 1;
-      data[targetName].total -= lastAmount;
-      data[targetName].lastSale = null; // only the most recent sale can be undone
+    if (agent && agent.count > 0 && agent.lastSale) {
+      const { amount, dayKey, weekKey } = agent.lastSale;
+
+      agent.count -= 1;
+      agent.total -= amount;
+      if (agent.daily[dayKey]) {
+        agent.daily[dayKey].count -= 1;
+        agent.daily[dayKey].total -= amount;
+      }
+      if (agent.weekly[weekKey]) {
+        agent.weekly[weekKey].count -= 1;
+        agent.weekly[weekKey].total -= amount;
+      }
+      agent.lastSale = null;
+
       saveData(data);
       await postToGroupMe(
-        `↩️ Removed last sale from ${targetName}. New total: ${formatMoney(data[targetName].total)} (${data[targetName].count} sales)\n\n${buildLeaderboard(data)}`
+        `↩️ Removed last sale from ${targetName}. New all-time total: ${formatMoney(agent.total)} (${agent.count} sales)`
       );
     } else {
-      await postToGroupMe(`⚠️ ${targetName} has no sales to undo.`);
+      await postToGroupMe(`⚠️ ${targetName} has no recent sale to undo.`);
     }
     return;
   }
 
-  // --- @leaderboard or !leaderboard ---
+  // --- @daily ---
+  if (/^[@!]daily\b/i.test(text)) {
+    await postToGroupMe(buildDailyLeaderboard(agents));
+    return;
+  }
+
+  // --- @weekly ---
+  if (/^[@!]weekly\b/i.test(text)) {
+    await postToGroupMe(buildWeeklyLeaderboard(agents));
+    return;
+  }
+
+  // --- @leaderboard or !leaderboard (all-time) ---
   if (/^[@!]leaderboard\b/i.test(text)) {
-    await postToGroupMe(buildLeaderboard(data));
+    await postToGroupMe(buildAllTimeLeaderboard(agents));
     return;
   }
 
   // --- @reset confirm (wipes everything) ---
   if (/^@reset confirm$/i.test(text)) {
-    saveData({});
+    saveData({ agents: {} });
     await postToGroupMe('🔄 Leaderboard has been reset to zero for everyone.');
     return;
   }
@@ -177,11 +286,13 @@ app.post('/callback', async (req, res) => {
     await postToGroupMe(
       '📋 Sales Bot Commands:\n' +
         '@sale — log a sale for yourself (no $ value)\n' +
-        '@sale 500 — log a sale worth $500 for yourself\n' +
+        '@sale 500 — log a $500 sale for yourself\n' +
         '@sale Mike 500 — log a $500 sale for Mike\n' +
         '@undo — remove your last sale\n' +
         "@undo Mike — remove Mike's last sale\n" +
-        '@leaderboard — show current standings\n' +
+        "@daily — show today's standings\n" +
+        '@weekly — show this week\'s standings\n' +
+        '@leaderboard — show all-time standings\n' +
         '@reset confirm — reset ALL totals to zero'
     );
     return;
